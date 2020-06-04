@@ -1,19 +1,20 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 #
 # trace         Trace a function and print a trace message based on its
 #               parameters, with an optional filter.
 #
-# usage: trace [-h] [-p PID] [-L TID] [-v] [-Z STRING_SIZE] [-S]
-#              [-M MAX_EVENTS] [-T] [-t] [-K] [-U] [-a] [-I header]
+# usage: trace [-h] [-p PID] [-L TID] [-v] [-Z STRING_SIZE] [-S] [-c cgroup_path]
+#              [-M MAX_EVENTS] [-s SYMBOLFILES] [-T] [-t] [-K] [-U] [-a] [-I header]
 #              probe [probe ...]
 #
 # Licensed under the Apache License, Version 2.0 (the "License")
 # Copyright (C) 2016 Sasha Goldshtein.
 
 from __future__ import print_function
-from bcc import BPF, USDT
+from bcc import BPF, USDT, StrcmpRewrite
 from functools import partial
 from time import sleep, strftime
+import time
 import argparse
 import re
 import ctypes as ct
@@ -27,7 +28,9 @@ class Probe(object):
         max_events = None
         event_count = 0
         first_ts = 0
+        first_ts_real = None
         print_time = False
+        print_unix_timestamp = False
         use_localtime = True
         time_field = False
         print_cpu = False
@@ -35,28 +38,34 @@ class Probe(object):
         tgid = -1
         pid = -1
         page_cnt = None
+        build_id_enabled = False
 
         @classmethod
         def configure(cls, args):
                 cls.max_events = args.max_events
                 cls.print_time = args.timestamp or args.time
+                cls.print_unix_timestamp = args.unix_timestamp
                 cls.use_localtime = not args.timestamp
                 cls.time_field = cls.print_time and (not cls.use_localtime)
                 cls.print_cpu = args.print_cpu
                 cls.print_address = args.address
                 cls.first_ts = BPF.monotonic_time()
+                cls.first_ts_real = time.time()
                 cls.tgid = args.tgid or -1
                 cls.pid = args.pid or -1
                 cls.page_cnt = args.buffer_pages
                 cls.bin_cmp = args.bin_cmp
+                cls.build_id_enabled = args.sym_file_list is not None
 
-        def __init__(self, probe, string_size, kernel_stack, user_stack):
+        def __init__(self, probe, string_size, kernel_stack, user_stack,
+                     cgroup_map_name, name, msg_filter):
                 self.usdt = None
                 self.streq_functions = ""
                 self.raw_probe = probe
                 self.string_size = string_size
                 self.kernel_stack = kernel_stack
                 self.user_stack = user_stack
+                self.probe_user_list = set()
                 Probe.probe_count += 1
                 self._parse_probe()
                 self.probe_num = Probe.probe_count
@@ -64,7 +73,9 @@ class Probe(object):
                                 (self._display_function(), self.probe_num)
                 self.probe_name = re.sub(r'[^A-Za-z0-9_]', '_',
                                          self.probe_name)
-
+                self.cgroup_map_name = cgroup_map_name
+                self.name = name
+                self.msg_filter = msg_filter
                 # compiler can generate proper codes for function
                 # signatures with "syscall__" prefix
                 if self.is_syscall_kprobe:
@@ -150,8 +161,9 @@ class Probe(object):
                         self.library = ""       # kernel
                         self.function = ""      # from TRACEPOINT_PROBE
                 elif self.probe_type == "u":
-                        self.library = ':'.join(parts[1:-1])
-                        self.usdt_name = parts[-1]
+                        # u:<library>[:<provider>]:<probe> where :<provider> is optional
+                        self.library = parts[1]
+                        self.usdt_name = ":".join(parts[2:])
                         self.function = ""      # no function, just address
                         # We will discover the USDT provider by matching on
                         # the USDT name in the specified library
@@ -170,8 +182,17 @@ class Probe(object):
                 target = Probe.pid if Probe.pid and Probe.pid != -1 \
                                    else Probe.tgid
                 self.usdt = USDT(path=self.library, pid=target)
+
+                parts = self.usdt_name.split(":")
+                if len(parts) == 1:
+                        provider_name = None
+                        usdt_name = parts[0].encode("ascii")
+                else:
+                        provider_name = parts[0].encode("ascii")
+                        usdt_name = parts[1].encode("ascii")
                 for probe in self.usdt.enumerate_probes():
-                        if probe.name == self.usdt_name.encode('ascii'):
+                        if ((not provider_name or probe.provider == provider_name)
+                                        and probe.name == usdt_name):
                                 return  # Found it, will enable later
                 self._bail("unrecognized USDT probe %s" % self.usdt_name)
 
@@ -180,10 +201,10 @@ class Probe(object):
 
         def _parse_types(self, fmt):
                 for match in re.finditer(
-                            r'[^%]%(s|u|d|llu|lld|hu|hd|x|llx|c|K|U)', fmt):
+                            r'[^%]%(s|u|d|lu|llu|ld|lld|hu|hd|x|lx|llx|c|K|U)', fmt):
                         self.types.append(match.group(1))
-                fmt = re.sub(r'([^%]%)(u|d|llu|lld|hu|hd)', r'\1d', fmt)
-                fmt = re.sub(r'([^%]%)(x|llx)', r'\1x', fmt)
+                fmt = re.sub(r'([^%]%)(u|d|lu|llu|ld|lld|hu|hd)', r'\1d', fmt)
+                fmt = re.sub(r'([^%]%)(x|lx|llx)', r'\1x', fmt)
                 fmt = re.sub('%K|%U', '%s', fmt)
                 self.python_format = fmt.strip('"')
 
@@ -216,18 +237,18 @@ class Probe(object):
         }
 
         aliases_indarg = {
-                "arg1": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM1(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM1(_ctx))); _val;})",
-                "arg2": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM2(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM2(_ctx))); _val;})",
-                "arg3": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM3(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM3(_ctx))); _val;})",
-                "arg4": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM4(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM4(_ctx))); _val;})",
-                "arg5": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM5(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM5(_ctx))); _val;})",
-                "arg6": "({u64 _val; struct pt_regs *_ctx = PT_REGS_PARM6(ctx);"
-                        "  bpf_probe_read(&_val, sizeof(_val), &(PT_REGS_PARM6(_ctx))); _val;})",
+                "arg1": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM1(_ctx))); _val;})",
+                "arg2": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM2(_ctx))); _val;})",
+                "arg3": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM3(_ctx))); _val;})",
+                "arg4": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM4(_ctx))); _val;})",
+                "arg5": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM5(_ctx))); _val;})",
+                "arg6": "({u64 _val; struct pt_regs *_ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);"
+                        "  bpf_probe_read_kernel(&_val, sizeof(_val), &(PT_REGS_PARM6(_ctx))); _val;})",
         }
 
         aliases_common = {
@@ -240,53 +261,41 @@ class Probe(object):
                 "$task" : "((struct task_struct *)bpf_get_current_task())"
         }
 
-        def _generate_streq_function(self, string):
-                fname = "streq_%d" % Probe.streq_index
-                Probe.streq_index += 1
-                self.streq_functions += """
-static inline bool %s(char const *ignored, uintptr_t str) {
-        char needle[] = %s;
-        char haystack[sizeof(needle)];
-        bpf_probe_read(&haystack, sizeof(haystack), (void *)str);
-        for (int i = 0; i < sizeof(needle) - 1; ++i) {
-                if (needle[i] != haystack[i]) {
-                        return false;
-                }
-        }
-        return true;
-}
-                """ % (fname, string)
-                return fname
-
         def _rewrite_expr(self, expr):
-                if self.is_syscall_kprobe:
-                    for alias, replacement in Probe.aliases_indarg.items():
-                        expr = expr.replace(alias, replacement)
-                else:
-                    for alias, replacement in Probe.aliases_arg.items():
-                        # For USDT probes, we replace argN values with the
-                        # actual arguments for that probe obtained using
-                        # bpf_readarg_N macros emitted at BPF construction.
-                        if self.probe_type == "u":
-                                continue
+                # Find the occurances of any arg[1-6]@user. Use it later to
+                # identify bpf_probe_read_user
+                for matches in re.finditer(r'(arg[1-6])(@user)', expr):
+                    if matches.group(1).strip() not in self.probe_user_list:
+                        self.probe_user_list.add(matches.group(1).strip())
+                # Remove @user occurrences from arg before resolving to its
+                # corresponding aliases.
+                expr = re.sub(r'(arg[1-6])@user', r'\1', expr)
+                rdict = StrcmpRewrite.rewrite_expr(expr,
+                            self.bin_cmp, self.library,
+                            self.probe_user_list, self.streq_functions,
+                            Probe.streq_index)
+                expr = rdict["expr"]
+                self.streq_functions = rdict["streq_functions"]
+                Probe.streq_index = rdict["probeid"]
+                alias_to_check = Probe.aliases_indarg \
+                                    if self.is_syscall_kprobe \
+                                    else Probe.aliases_arg
+                # For USDT probes, we replace argN values with the
+                # actual arguments for that probe obtained using
+                # bpf_readarg_N macros emitted at BPF construction.
+                if not self.probe_type == "u":
+                    for alias, replacement in alias_to_check.items():
                         expr = expr.replace(alias, replacement)
                 for alias, replacement in Probe.aliases_common.items():
                     expr = expr.replace(alias, replacement)
-                if self.bin_cmp:
-                    STRCMP_RE = 'STRCMP\\(\"([^"]+)\\"'
-                else:
-                    STRCMP_RE = 'STRCMP\\(("[^"]+\\")'
-                matches = re.finditer(STRCMP_RE, expr)
-                for match in matches:
-                        string = match.group(1)
-                        fname = self._generate_streq_function(string)
-                        expr = expr.replace("STRCMP", fname, 1)
                 return expr
 
-        p_type = {"u": ct.c_uint, "d": ct.c_int,
+        p_type = {"u": ct.c_uint, "d": ct.c_int, "lu": ct.c_ulong,
+                  "ld": ct.c_long,
                   "llu": ct.c_ulonglong, "lld": ct.c_longlong,
                   "hu": ct.c_ushort, "hd": ct.c_short,
-                  "x": ct.c_uint, "llx": ct.c_ulonglong, "c": ct.c_ubyte,
+                  "x": ct.c_uint, "lx": ct.c_ulong, "llx": ct.c_ulonglong,
+                  "c": ct.c_ubyte,
                   "K": ct.c_ulonglong, "U": ct.c_ulonglong}
 
         def _generate_python_field_decl(self, idx, fields):
@@ -320,9 +329,11 @@ static inline bool %s(char const *ignored, uintptr_t str) {
                             dict(_fields_=fields))
 
         c_type = {"u": "unsigned int", "d": "int",
+                  "lu": "unsigned long", "ld": "long",
                   "llu": "unsigned long long", "lld": "long long",
                   "hu": "unsigned short", "hd": "short",
-                  "x": "unsigned int", "llx": "unsigned long long",
+                  "x": "unsigned int", "lx": "unsigned long",
+                  "llx": "unsigned long long",
                   "c": "char", "K": "unsigned long long",
                   "U": "unsigned long long"}
         fmt_types = c_type.keys()
@@ -342,7 +353,9 @@ static inline bool %s(char const *ignored, uintptr_t str) {
                 self.events_name = "%s_events" % self.probe_name
                 self.struct_name = "%s_data_t" % self.probe_name
                 self.stacks_name = "%s_stacks" % self.probe_name
-                stack_table = "BPF_STACK_TRACE(%s, 1024);" % self.stacks_name \
+                stack_type = "BPF_STACK_TRACE" if self.build_id_enabled is False \
+                             else "BPF_STACK_TRACE_BUILDID"
+                stack_table = "%s(%s, 1024);" % (stack_type,self.stacks_name) \
                               if (self.kernel_stack or self.user_stack) else ""
                 data_fields = ""
                 for i, field_type in enumerate(self.types):
@@ -386,13 +399,24 @@ BPF_PERF_OUTPUT(%s);
                         text = ("        %s %s = 0;\n" +
                                 "        bpf_usdt_readarg(%s, ctx, &%s);\n") \
                                 % (arg_ctype, expr, expr[3], expr)
-
+                probe_read_func = "bpf_probe_read_kernel"
                 if field_type == "s":
+                        if self.library:
+                            probe_read_func = "bpf_probe_read_user"
+                        else:
+                            alias_to_check = Probe.aliases_indarg \
+                                                if self.is_syscall_kprobe \
+                                                else Probe.aliases_arg
+                            for arg, alias in alias_to_check.items():
+                                if alias == expr and arg in self.probe_user_list:
+                                    probe_read_func = "bpf_probe_read_user"
+                                    break
                         return text + """
         if (%s != 0) {
-                bpf_probe_read(&__data.v%d, sizeof(__data.v%d), (void *)%s);
+                void *__tmp = (void *)%s;
+                %s(&__data.v%d, sizeof(__data.v%d), __tmp);
         }
-                """ % (expr, idx, idx, expr)
+                """ % (expr, expr, probe_read_func, idx, idx)
                 if field_type in Probe.fmt_types:
                         return text + "        __data.v%d = (%s)%s;\n" % \
                                         (idx, Probe.c_type[field_type], expr)
@@ -439,6 +463,13 @@ BPF_PERF_OUTPUT(%s);
                 else:
                         pid_filter = ""
 
+                if self.cgroup_map_name is not None:
+                        cgroup_filter = """
+        if (%s.check_current_task(0) <= 0) { return 0; }
+                """ % self.cgroup_map_name
+                else:
+                        cgroup_filter = ""
+
                 prefix = ""
                 signature = "struct pt_regs *ctx"
                 if self.signature:
@@ -464,12 +495,12 @@ BPF_PERF_OUTPUT(%s);
                 if self.user_stack:
                         stack_trace += """
         __data.user_stack_id = %s.get_stackid(
-          %s, BPF_F_REUSE_STACKID | BPF_F_USER_STACK
+          %s, BPF_F_USER_STACK
         );""" % (self.stacks_name, ctx_name)
                 if self.kernel_stack:
                         stack_trace += """
         __data.kernel_stack_id = %s.get_stackid(
-          %s, BPF_F_REUSE_STACKID
+          %s, 0
         );""" % (self.stacks_name, ctx_name)
 
                 text = heading + """
@@ -477,6 +508,7 @@ BPF_PERF_OUTPUT(%s);
         u64 __pid_tgid = bpf_get_current_pid_tgid();
         u32 __tgid = __pid_tgid >> 32;
         u32 __pid = __pid_tgid; // implicit cast to u32 for bottom half
+        %s
         %s
         %s
         %s
@@ -494,7 +526,7 @@ BPF_PERF_OUTPUT(%s);
         return 0;
 }
 """
-                text = text % (pid_filter, prefix,
+                text = text % (pid_filter, cgroup_filter, prefix,
                                self._generate_usdt_filter_read(), self.filter,
                                self.struct_name, time_str, cpu_str, data_fields,
                                stack_trace, self.events_name, ctx_name)
@@ -503,7 +535,11 @@ BPF_PERF_OUTPUT(%s);
 
         @classmethod
         def _time_off_str(cls, timestamp_ns):
-                return "%.6f" % (1e-9 * (timestamp_ns - cls.first_ts))
+            offset = 1e-9 * (timestamp_ns - cls.first_ts)
+            if cls.print_unix_timestamp:
+                return "%.6f" % (offset + cls.first_ts_real)
+            else:
+                return "%.6f" % offset
 
         def _display_function(self):
                 if self.probe_type == 'p' or self.probe_type == 'r':
@@ -543,17 +579,25 @@ BPF_PERF_OUTPUT(%s);
                 # Cast as the generated structure type and display
                 # according to the format string in the probe.
                 event = ct.cast(data, ct.POINTER(self.python_struct)).contents
+                if self.name and bytes(self.name) not in event.comm:
+                    return
                 values = map(lambda i: getattr(event, "v%d" % i),
                              range(0, len(self.values)))
                 msg = self._format_message(bpf, event.tgid, values)
+                if self.msg_filter and bytes(self.msg_filter) not in msg:
+                    return
                 if Probe.print_time:
                     time = strftime("%H:%M:%S") if Probe.use_localtime else \
                            Probe._time_off_str(event.timestamp_ns)
-                    print("%-8s " % time[:8], end="")
+                    if Probe.print_unix_timestamp:
+                        print("%-17s " % time[:17], end="")
+                    else:
+                        print("%-8s " % time[:8], end="")
                 if Probe.print_cpu:
                     print("%-3s " % event.cpu, end="")
                 print("%-7d %-7d %-15s %-16s %s" %
-                      (event.tgid, event.pid, event.comm.decode(),
+                      (event.tgid, event.pid,
+                       event.comm.decode('utf-8', 'replace'),
                        self._display_function(), msg))
 
                 if self.kernel_stack:
@@ -567,6 +611,7 @@ BPF_PERF_OUTPUT(%s);
                 if Probe.max_events is not None and \
                    Probe.event_count >= Probe.max_events:
                         exit()
+                sys.stdout.flush()
 
         def attach(self, bpf, verbose):
                 if len(self.library) == 0:
@@ -617,6 +662,10 @@ trace do_sys_open
         Trace the open syscall and print a default trace message when entered
 trace 'do_sys_open "%s", arg2'
         Trace the open syscall and print the filename being opened
+trace 'do_sys_open "%s", arg2' -n main
+        Trace the open syscall and only print event that process names containing "main"
+trace 'do_sys_open "%s", arg2' -f config
+        Trace the open syscall and print the filename being opened filtered by "config"
 trace 'sys_read (arg3 > 20000) "read %d bytes", arg3'
         Trace the read syscall and print a message for reads >20000 bytes
 trace 'r::do_sys_open "%llx", retval'
@@ -635,8 +684,13 @@ trace 't:block:block_rq_complete "sectors=%d", args->nr_sector'
         Trace the block_rq_complete kernel tracepoint and print # of tx sectors
 trace 'u:pthread:pthread_create (arg4 != 0)'
         Trace the USDT probe pthread_create when its 4th argument is non-zero
+trace 'u:pthread:libpthread:pthread_create (arg4 != 0)'
+        Ditto, but the provider name "libpthread" is specified.
 trace 'p::SyS_nanosleep(struct timespec *ts) "sleep for %lld ns", ts->tv_nsec'
         Trace the nanosleep syscall and print the sleep duration in ns
+trace -c /sys/fs/cgroup/system.slice/workload.service '__x64_sys_nanosleep' '__x64_sys_clone'
+        Trace nanosleep/clone syscall calls only under workload.service
+        cgroup hierarchy.
 trace -I 'linux/fs.h' \\
       'p::uprobe_register(struct inode *inode) "a_ops = %llx", inode->i_mapping->a_ops'
         Trace the uprobe_register inode mapping ops, and the symbol can be found
@@ -681,12 +735,25 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
                   help="number of events to print before quitting")
                 parser.add_argument("-t", "--timestamp", action="store_true",
                   help="print timestamp column (offset from trace start)")
+                parser.add_argument("-u", "--unix-timestamp", action="store_true",
+                  help="print UNIX timestamp instead of offset from trace start, requires -t")
                 parser.add_argument("-T", "--time", action="store_true",
                   help="print time column")
                 parser.add_argument("-C", "--print_cpu", action="store_true",
                   help="print CPU id")
+                parser.add_argument("-c", "--cgroup-path", type=str, \
+                  metavar="CGROUP_PATH", dest="cgroup_path", \
+                  help="cgroup path")
+                parser.add_argument("-n", "--name", type=str,
+                                    help="only print process names containing this name")
+                parser.add_argument("-f", "--msg-filter", type=str, dest="msg_filter",
+                                    help="only print the msg of event containing this string")
                 parser.add_argument("-B", "--bin_cmp", action="store_true",
                   help="allow to use STRCMP with binary values")
+                parser.add_argument('-s', "--sym_file_list", type=str, \
+                  metavar="SYM_FILE_LIST", dest="sym_file_list", \
+                  help="coma separated list of symbol files to use \
+                  for symbol resolution")
                 parser.add_argument("-K", "--kernel-stack",
                   action="store_true", help="output kernel stack trace")
                 parser.add_argument("-U", "--user-stack",
@@ -706,6 +773,10 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
                 self.args = parser.parse_args()
                 if self.args.tgid and self.args.pid:
                         parser.error("only one of -p and -L may be specified")
+                if self.args.cgroup_path is not None:
+                        self.cgroup_map_name = "__cgroup"
+                else:
+                        self.cgroup_map_name = None
 
         def _create_probes(self):
                 Probe.configure(self.args)
@@ -713,7 +784,8 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
                 for probe_spec in self.args.probes:
                         self.probes.append(Probe(
                                 probe_spec, self.args.string_size,
-                                self.args.kernel_stack, self.args.user_stack))
+                                self.args.kernel_stack, self.args.user_stack,
+                                self.cgroup_map_name, self.args.name, self.args.msg_filter))
 
         def _generate_program(self):
                 self.program = """
@@ -729,6 +801,9 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
                                 self.program += "#include <%s>\n" % include
                 self.program += BPF.generate_auto_includes(
                         map(lambda p: p.raw_probe, self.probes))
+                if self.cgroup_map_name is not None:
+                        self.program += "BPF_CGROUP_ARRAY(%s, 1);\n" % \
+                                        self.cgroup_map_name
                 for probe in self.probes:
                         self.program += probe.generate_program(
                                         self.args.include_self)
@@ -751,6 +826,15 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
                                 print(probe.usdt.get_text())
                         usdt_contexts.append(probe.usdt)
                 self.bpf = BPF(text=self.program, usdt_contexts=usdt_contexts)
+                if self.args.sym_file_list is not None:
+                  print("Note: Kernel bpf will report stack map with ip/build_id")
+                  map(lambda x: self.bpf.add_module(x), self.args.sym_file_list.split(','))
+
+                # if cgroup filter is requested, update the cgroup array map
+                if self.cgroup_map_name is not None:
+                        cgroup_array = self.bpf.get_table(self.cgroup_map_name)
+                        cgroup_array[0] = self.args.cgroup_path
+
                 for probe in self.probes:
                         if self.args.verbose:
                                 print(probe)
@@ -762,12 +846,14 @@ trace -I 'linux/fs_struct.h' 'mntns_install "users = %d", $task->fs->users'
 
                 # Print header
                 if self.args.timestamp or self.args.time:
-                    print("%-8s " % "TIME", end="");
+                    col_fmt = "%-17s " if self.args.unix_timestamp else "%-8s "
+                    print(col_fmt % "TIME", end="");
                 if self.args.print_cpu:
                     print("%-3s " % "CPU", end="");
                 print("%-7s %-7s %-15s %-16s %s" %
                       ("PID", "TID", "COMM", "FUNC",
                       "-" if not all_probes_trivial else ""))
+                sys.stdout.flush()
 
                 while True:
                         self.bpf.perf_buffer_poll()

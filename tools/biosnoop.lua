@@ -84,13 +84,14 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
     valp = infobyreq.lookup(&req);
     if (valp == 0) {
         data.len = req->__data_len;
-        strcpy(data.name,"?");
+        data.name[0] = '?';
+        data.name[1] = 0;
     } else {
         data.pid = valp->pid;
         data.len = req->__data_len;
         data.sector = req->__sector;
-        bpf_probe_read(&data.name, sizeof(data.name), valp->name);
-        bpf_probe_read(&data.disk_name, sizeof(data.disk_name),
+        bpf_probe_read_kernel(&data.name, sizeof(data.name), valp->name);
+        bpf_probe_read_kernel(&data.disk_name, sizeof(data.disk_name),
                        req->rq_disk->disk_name);
     }
 

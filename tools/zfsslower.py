@@ -31,7 +31,6 @@ from __future__ import print_function
 from bcc import BPF
 import argparse
 from time import strftime
-import ctypes as ct
 
 # arguments
 examples = """examples:
@@ -193,7 +192,7 @@ static int trace_return(struct pt_regs *ctx, int type)
     struct qstr qs = valp->fp->f_path.dentry->d_name;
     if (qs.len == 0)
         return 0;
-    bpf_probe_read(&data.file, sizeof(data.file), (void *)qs.name);
+    bpf_probe_read_kernel(&data.file, sizeof(data.file), (void *)qs.name);
 
     // output
     events.perf_submit(ctx, &data, sizeof(data));
@@ -236,24 +235,9 @@ if debug or args.ebpf:
     if args.ebpf:
         exit()
 
-# kernel->user event data: struct data_t
-DNAME_INLINE_LEN = 32   # linux/dcache.h
-TASK_COMM_LEN = 16      # linux/sched.h
-class Data(ct.Structure):
-    _fields_ = [
-        ("ts_us", ct.c_ulonglong),
-        ("type", ct.c_ulonglong),
-        ("size", ct.c_ulonglong),
-        ("offset", ct.c_ulonglong),
-        ("delta_us", ct.c_ulonglong),
-        ("pid", ct.c_ulonglong),
-        ("task", ct.c_char * TASK_COMM_LEN),
-        ("file", ct.c_char * DNAME_INLINE_LEN)
-    ]
-
 # process event
 def print_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b["events"].event(data)
 
     type = 'R'
     if event.type == 1:
@@ -265,12 +249,14 @@ def print_event(cpu, data, size):
 
     if (csv):
         print("%d,%s,%d,%s,%d,%d,%d,%s" % (
-            event.ts_us, event.task.decode(), event.pid, type, event.size,
-            event.offset, event.delta_us, event.file.decode()))
+            event.ts_us, event.task.decode('utf-8', 'replace'), event.pid,
+            type, event.size, event.offset, event.delta_us,
+            event.file.decode('utf-8', 'replace')))
         return
     print("%-8s %-14.14s %-6s %1s %-7s %-8d %7.2f %s" % (strftime("%H:%M:%S"),
-        event.task.decode(), event.pid, type, event.size, event.offset / 1024,
-        float(event.delta_us) / 1000, event.file.decode()))
+        event.task.decode('utf-8', 'replace'), event.pid, type, event.size,
+        event.offset / 1024, float(event.delta_us) / 1000,
+        event.file.decode('utf-8', 'replace')))
 
 # initialize BPF
 b = BPF(text=bpf_text)
@@ -313,4 +299,7 @@ else:
 # read events
 b["events"].open_perf_buffer(print_event, page_cnt=64)
 while 1:
-    b.perf_buffer_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

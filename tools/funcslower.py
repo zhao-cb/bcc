@@ -24,7 +24,6 @@
 from __future__ import print_function
 from bcc import BPF
 import argparse
-import ctypes as ct
 import time
 
 examples = """examples:
@@ -83,7 +82,11 @@ struct entry_t {
     u64 id;
     u64 start_ns;
 #ifdef GRAB_ARGS
+#ifndef __s390x__
     u64 args[6];
+#else
+    u64 args[5];
+#endif
 #endif
 };
 
@@ -94,15 +97,19 @@ struct data_t {
     u64 duration_ns;
     u64 retval;
     char comm[TASK_COMM_LEN];
+#ifdef GRAB_ARGS
+#ifndef __s390x__
+    u64 args[6];
+#else
+    u64 args[5];
+#endif
+#endif
 #ifdef USER_STACKS
     int user_stack_id;
 #endif
 #ifdef KERNEL_STACKS
     int kernel_stack_id;
     u64 kernel_ip;
-#endif
-#ifdef GRAB_ARGS
-    u64 args[6];
 #endif
 };
 
@@ -131,7 +138,9 @@ static int trace_entry(struct pt_regs *ctx, int id)
     entry.args[2] = PT_REGS_PARM3(ctx);
     entry.args[3] = PT_REGS_PARM4(ctx);
     entry.args[4] = PT_REGS_PARM5(ctx);
+#ifndef __s390x__
     entry.args[5] = PT_REGS_PARM6(ctx);
+#endif
 #endif
 
     entryinfo.update(&tgid_pid, &entry);
@@ -197,7 +206,7 @@ int trace_return(struct pt_regs *ctx)
 #endif
 
 #ifdef GRAB_ARGS
-    bpf_probe_read(&data.args[0], sizeof(data.args), entryp->args);
+    bpf_probe_read_kernel(&data.args[0], sizeof(data.args), entryp->args);
 #endif
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     events.perf_submit(ctx, &data, sizeof(data));
@@ -240,20 +249,6 @@ for i, function in enumerate(args.functions):
     else:
         b.attach_kprobe(event=function, fn_name="trace_%d" % i)
         b.attach_kretprobe(event=function, fn_name="trace_return")
-
-TASK_COMM_LEN = 16  # linux/sched.h
-
-class Data(ct.Structure):
-    _fields_ = [
-        ("id", ct.c_ulonglong),
-        ("tgid_pid", ct.c_ulonglong),
-        ("start_ns", ct.c_ulonglong),
-        ("duration_ns", ct.c_ulonglong),
-        ("retval", ct.c_ulonglong),
-        ("comm", ct.c_char * TASK_COMM_LEN)
-    ] + ([("args", ct.c_ulonglong * 6)] if args.arguments else []) + \
-            ([("user_stack_id", ct.c_int)] if args.user_stack else []) + \
-            ([("kernel_stack_id", ct.c_int),("kernel_ip", ct.c_ulonglong)] if args.kernel_stack else [])
 
 time_designator = "us" if args.min_us else "ms"
 time_value = args.min_us or args.min_ms or 1
@@ -306,7 +301,7 @@ def print_stack(event):
         # print folded stack output
         user_stack = list(user_stack)
         kernel_stack = list(kernel_stack)
-        line = [event.comm.decode()] + \
+        line = [event.comm.decode('utf-8', 'replace')] + \
             [b.sym(addr, event.tgid_pid) for addr in reversed(user_stack)] + \
             (do_delimiter and ["-"] or []) + \
             [b.ksym(addr) for addr in reversed(kernel_stack)]
@@ -319,15 +314,18 @@ def print_stack(event):
             print("    %s" % b.sym(addr, event.tgid_pid))
 
 def print_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b["events"].event(data)
     ts = float(event.duration_ns) / time_multiplier
     if not args.folded:
         print((time_str(event) + "%-14.14s %-6s %7.2f %16x %s %s") %
-            (event.comm.decode(), event.tgid_pid >> 32,
+            (event.comm.decode('utf-8', 'replace'), event.tgid_pid >> 32,
              ts, event.retval, args.functions[event.id], args_str(event)))
     if args.user_stack or args.kernel_stack:
         print_stack(event)
 
 b["events"].open_perf_buffer(print_event, page_cnt=64)
 while True:
-    b.perf_buffer_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

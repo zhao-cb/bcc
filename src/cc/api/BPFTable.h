@@ -32,6 +32,7 @@
 #include "libbpf.h"
 #include "perf_reader.h"
 #include "table_desc.h"
+#include "linux/bpf.h"
 
 namespace ebpf {
 
@@ -62,6 +63,10 @@ class BPFTableBase {
     if (!rc.code())
       value_str.assign(buf);
     return rc;
+  }
+
+  int get_fd() {
+    return desc.fd;
   }
 
  protected:
@@ -104,6 +109,7 @@ class BPFTable : public BPFTableBase<void, void> {
   StatusTuple remove_value(const std::string& key_str);
 
   StatusTuple clear_table_non_atomic();
+  StatusTuple get_table_offline(std::vector<std::pair<std::string, std::string>> &res);
 
   static size_t get_possible_cpu_count();
 };
@@ -131,14 +137,14 @@ class BPFArrayTable : public BPFTableBase<int, ValueType> {
   virtual StatusTuple get_value(const int& index, ValueType& value) {
     if (!this->lookup(const_cast<int*>(&index), get_value_addr(value)))
       return StatusTuple(-1, "Error getting value: %s", std::strerror(errno));
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 
   virtual StatusTuple update_value(const int& index, const ValueType& value) {
     if (!this->update(const_cast<int*>(&index),
                       get_value_addr(const_cast<ValueType&>(value))))
       return StatusTuple(-1, "Error updating value: %s", std::strerror(errno));
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 
   ValueType operator[](const int& key) {
@@ -205,20 +211,20 @@ class BPFHashTable : public BPFTableBase<KeyType, ValueType> {
   virtual StatusTuple get_value(const KeyType& key, ValueType& value) {
     if (!this->lookup(const_cast<KeyType*>(&key), get_value_addr(value)))
       return StatusTuple(-1, "Error getting value: %s", std::strerror(errno));
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 
   virtual StatusTuple update_value(const KeyType& key, const ValueType& value) {
     if (!this->update(const_cast<KeyType*>(&key),
                       get_value_addr(const_cast<ValueType&>(value))))
       return StatusTuple(-1, "Error updating value: %s", std::strerror(errno));
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 
   virtual StatusTuple remove_value(const KeyType& key) {
     if (!this->remove(const_cast<KeyType*>(&key)))
       return StatusTuple(-1, "Error removing value: %s", std::strerror(errno));
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 
   ValueType operator[](const KeyType& key) {
@@ -254,7 +260,7 @@ class BPFHashTable : public BPFTableBase<KeyType, ValueType> {
     while (this->first(&cur))
       TRY2(remove_value(cur));
 
-    return StatusTuple(0);
+    return StatusTuple::OK();
   }
 };
 
@@ -314,6 +320,26 @@ class BPFStackTable : public BPFTableBase<int, stacktrace_t> {
   std::map<int, void*> pid_sym_;
 };
 
+// from src/cc/export/helpers.h
+struct stacktrace_buildid_t {
+  struct bpf_stack_build_id trace[BPF_MAX_STACK_DEPTH];
+};
+
+class BPFStackBuildIdTable : public BPFTableBase<int, stacktrace_buildid_t> {
+ public:
+  BPFStackBuildIdTable(const TableDesc& desc, bool use_debug_file,
+                       bool check_debug_file_crc, void *bsymcache);
+  ~BPFStackBuildIdTable() = default;
+
+  void clear_table_non_atomic();
+  std::vector<bpf_stack_build_id> get_stack_addr(int stack_id);
+  std::vector<std::string> get_stack_symbol(int stack_id);
+
+ private:
+  void *bsymcache_;
+  bcc_symbol_option symbol_option_;
+};
+
 class BPFPerfBuffer : public BPFTableBase<int, int> {
  public:
   BPFPerfBuffer(const TableDesc& desc);
@@ -365,6 +391,136 @@ class BPFCgroupArray : public BPFTableBase<int, int> {
   StatusTuple update_value(const int& index, const int& cgroup2_fd);
   StatusTuple update_value(const int& index, const std::string& cgroup2_path);
   StatusTuple remove_value(const int& index);
+};
+
+class BPFDevmapTable : public BPFTableBase<int, int> {
+public:
+  BPFDevmapTable(const TableDesc& desc);
+
+  StatusTuple update_value(const int& index, const int& value);
+  StatusTuple get_value(const int& index, int& value);
+  StatusTuple remove_value(const int& index);
+};
+
+class BPFXskmapTable : public BPFTableBase<int, int> {
+public:
+  BPFXskmapTable(const TableDesc& desc);
+
+  StatusTuple update_value(const int& index, const int& value);
+  StatusTuple get_value(const int& index, int& value);
+  StatusTuple remove_value(const int& index);
+};
+
+class BPFMapInMapTable : public BPFTableBase<int, int> {
+public:
+  BPFMapInMapTable(const TableDesc& desc);
+
+  StatusTuple update_value(const int& index, const int& inner_map_fd);
+  StatusTuple remove_value(const int& index);
+};
+
+class BPFSockmapTable : public BPFTableBase<int, int> {
+public:
+  BPFSockmapTable(const TableDesc& desc);
+
+  StatusTuple update_value(const int& index, const int& value);
+  StatusTuple remove_value(const int& index);
+};
+
+class BPFSockhashTable : public BPFTableBase<int, int> {
+public:
+  BPFSockhashTable(const TableDesc& desc);
+
+  StatusTuple update_value(const int& key, const int& value);
+  StatusTuple remove_value(const int& key);
+};
+
+template <class ValueType>
+class BPFSkStorageTable : public BPFTableBase<int, ValueType> {
+ public:
+  BPFSkStorageTable(const TableDesc& desc) : BPFTableBase<int, ValueType>(desc) {
+    if (desc.type != BPF_MAP_TYPE_SK_STORAGE)
+      throw std::invalid_argument("Table '" + desc.name +
+                                  "' is not a sk_storage table");
+  }
+
+  virtual StatusTuple get_value(const int& sock_fd, ValueType& value) {
+    if (!this->lookup(const_cast<int*>(&sock_fd), get_value_addr(value)))
+      return StatusTuple(-1, "Error getting value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+
+  virtual StatusTuple update_value(const int& sock_fd, const ValueType& value) {
+    if (!this->update(const_cast<int*>(&sock_fd),
+                      get_value_addr(const_cast<ValueType&>(value))))
+      return StatusTuple(-1, "Error updating value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+
+  virtual StatusTuple remove_value(const int& sock_fd) {
+    if (!this->remove(const_cast<int*>(&sock_fd)))
+      return StatusTuple(-1, "Error removing value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+};
+
+template <class ValueType>
+class BPFCgStorageTable : public BPFTableBase<int, ValueType> {
+ public:
+  BPFCgStorageTable(const TableDesc& desc) : BPFTableBase<int, ValueType>(desc) {
+    if (desc.type != BPF_MAP_TYPE_CGROUP_STORAGE)
+      throw std::invalid_argument("Table '" + desc.name +
+                                  "' is not a cgroup_storage table");
+  }
+
+  virtual StatusTuple get_value(struct bpf_cgroup_storage_key& key,
+                                ValueType& value) {
+    if (!this->lookup(const_cast<struct bpf_cgroup_storage_key*>(&key),
+                      get_value_addr(value)))
+      return StatusTuple(-1, "Error getting value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+
+  virtual StatusTuple update_value(struct bpf_cgroup_storage_key& key, const ValueType& value) {
+    if (!this->update(const_cast<struct bpf_cgroup_storage_key*>(&key),
+                      get_value_addr(const_cast<ValueType&>(value))))
+      return StatusTuple(-1, "Error updating value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+};
+
+template <class ValueType>
+class BPFPercpuCgStorageTable : public BPFTableBase<int, std::vector<ValueType>> {
+ public:
+  BPFPercpuCgStorageTable(const TableDesc& desc)
+      : BPFTableBase<int, std::vector<ValueType>>(desc) {
+    if (desc.type != BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE)
+      throw std::invalid_argument("Table '" + desc.name +
+                                  "' is not a percpu_cgroup_storage table");
+    if (sizeof(ValueType) % 8)
+      throw std::invalid_argument("leaf must be aligned to 8 bytes");
+    ncpus = BPFTable::get_possible_cpu_count();
+  }
+
+  virtual StatusTuple get_value(struct bpf_cgroup_storage_key& key,
+                                std::vector<ValueType>& value) {
+    value.resize(ncpus);
+    if (!this->lookup(const_cast<struct bpf_cgroup_storage_key*>(&key),
+                      get_value_addr(value)))
+      return StatusTuple(-1, "Error getting value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+
+  virtual StatusTuple update_value(struct bpf_cgroup_storage_key& key,
+                                   std::vector<ValueType>& value) {
+    value.resize(ncpus);
+    if (!this->update(const_cast<struct bpf_cgroup_storage_key*>(&key),
+                      get_value_addr(const_cast<std::vector<ValueType>&>(value))))
+      return StatusTuple(-1, "Error updating value: %s", std::strerror(errno));
+    return StatusTuple::OK();
+  }
+ private:
+  unsigned int ncpus;
 };
 
 }  // namespace ebpf

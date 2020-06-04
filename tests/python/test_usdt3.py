@@ -20,6 +20,7 @@ class TestUDST(TestCase):
 static inline void record_val(int val)
 {
   FOLLY_SDT(test, probe, val);
+  FOLLY_SDT(test_dup_name, probe, val);
 }
 
 extern void record_a(int val);
@@ -105,12 +106,12 @@ int do_trace(struct pt_regs *ctx) {
 
         # Run the application
         self.app = Popen([m_bin], env=dict(os.environ, LD_LIBRARY_PATH=self.tmp_dir))
-        # os.system("tplist.py -vvv -p " + str(self.app.pid))
+        os.system("../../tools/tplist.py -vvv -p " + str(self.app.pid))
 
     def test_attach1(self):
         # enable USDT probe from given PID and verifier generated BPF programs
         u = USDT(pid=int(self.app.pid))
-        u.enable_probe(probe="probe", fn_name="do_trace")
+        u.enable_probe(probe="test:probe", fn_name="do_trace")
         b = BPF(text=self.bpf_text, usdt_contexts=[u])
 
         # processing events
@@ -131,8 +132,14 @@ int do_trace(struct pt_regs *ctx) {
                 self.probe_value_other = 1
 
         b["event"].open_perf_buffer(print_event)
-        for i in range(10):
-            b.perf_buffer_poll()
+        for i in range(100):
+            if (self.probe_value_1 == 0 or
+                self.probe_value_2 == 0 or
+                self.probe_value_3 == 0 or
+                self.probe_value_other != 0):
+                b.perf_buffer_poll()
+            else:
+                break;
 
         self.assertTrue(self.probe_value_1 != 0)
         self.assertTrue(self.probe_value_2 != 0)

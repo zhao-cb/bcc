@@ -15,7 +15,6 @@
 from __future__ import print_function
 from bcc import BPF
 import argparse
-import ctypes as ct
 import sys
 import subprocess
 import os.path
@@ -271,18 +270,6 @@ else:
 
 b = BPF(text=bpf_text)
 
-TASK_COMM_LEN = 16    # linux/sched.h
-
-class Data(ct.Structure):
-    _fields_ = [
-        ("time", ct.c_ulonglong),
-        ("stack_id", ct.c_longlong),
-        ("cpu", ct.c_int),
-        ("id", ct.c_ulonglong),
-        ("addrs", ct.c_int * 4),
-        ("comm", ct.c_char * TASK_COMM_LEN),
-    ]
-
 def get_syms(kstack):
     syms = []
 
@@ -296,7 +283,7 @@ def get_syms(kstack):
 def print_event(cpu, data, size):
     try:
         global b
-        event = ct.cast(data, ct.POINTER(Data)).contents
+        event = b["events"].event(data)
         stack_traces = b['stack_traces']
         stext = b.ksymname('_stext')
 
@@ -319,7 +306,7 @@ def print_event(cpu, data, size):
             print("NO STACK FOUND DUE TO COLLISION")
         print("===================================")
         print("")
-    except:
+    except Exception:
         sys.exit(0)
 
 b["events"].open_perf_buffer(print_event, page_cnt=256)
@@ -328,4 +315,7 @@ print("Finding critical section with {} disabled for > {}us".format(
     ('preempt' if preemptoff else 'IRQ'), args.duration))
 
 while 1:
-    b.perf_buffer_poll();
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

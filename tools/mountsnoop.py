@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 #
 # mountsnoop Trace mount() and umount syscalls.
 #            For Linux, uses BCC, eBPF. Embedded C.
@@ -88,10 +88,8 @@ BPF_PERF_OUTPUT(events);
 
 int syscall__mount(struct pt_regs *ctx, char __user *source,
                       char __user *target, char __user *type,
-                      unsigned long flags)
+                      unsigned long flags, char __user *data)
 {
-    /* sys_mount takes too many arguments */
-    char __user *data = (char __user *)PT_REGS_PARM5(ctx);
     struct data_t event = {};
     struct task_struct *task;
     struct nsproxy *nsproxy;
@@ -110,23 +108,23 @@ int syscall__mount(struct pt_regs *ctx, char __user *source,
     events.perf_submit(ctx, &event, sizeof(event));
 
     event.type = EVENT_MOUNT_SOURCE;
-    memset(event.str, 0, sizeof(event.str));
-    bpf_probe_read(event.str, sizeof(event.str), source);
+    __builtin_memset(event.str, 0, sizeof(event.str));
+    bpf_probe_read_user(event.str, sizeof(event.str), source);
     events.perf_submit(ctx, &event, sizeof(event));
 
     event.type = EVENT_MOUNT_TARGET;
-    memset(event.str, 0, sizeof(event.str));
-    bpf_probe_read(event.str, sizeof(event.str), target);
+    __builtin_memset(event.str, 0, sizeof(event.str));
+    bpf_probe_read_user(event.str, sizeof(event.str), target);
     events.perf_submit(ctx, &event, sizeof(event));
 
     event.type = EVENT_MOUNT_TYPE;
-    memset(event.str, 0, sizeof(event.str));
-    bpf_probe_read(event.str, sizeof(event.str), type);
+    __builtin_memset(event.str, 0, sizeof(event.str));
+    bpf_probe_read_user(event.str, sizeof(event.str), type);
     events.perf_submit(ctx, &event, sizeof(event));
 
     event.type = EVENT_MOUNT_DATA;
-    memset(event.str, 0, sizeof(event.str));
-    bpf_probe_read(event.str, sizeof(event.str), data);
+    __builtin_memset(event.str, 0, sizeof(event.str));
+    bpf_probe_read_user(event.str, sizeof(event.str), data);
     events.perf_submit(ctx, &event, sizeof(event));
 
     return 0;
@@ -165,8 +163,8 @@ int syscall__umount(struct pt_regs *ctx, char __user *target, int flags)
     events.perf_submit(ctx, &event, sizeof(event));
 
     event.type = EVENT_UMOUNT_TARGET;
-    memset(event.str, 0, sizeof(event.str));
-    bpf_probe_read(event.str, sizeof(event.str), target);
+    __builtin_memset(event.str, 0, sizeof(event.str));
+    bpf_probe_read_user(event.str, sizeof(event.str), target);
     events.perf_submit(ctx, &event, sizeof(event));
 
     return 0;
@@ -382,8 +380,8 @@ def print_event(mounts, umounts, cpu, data, size):
                     flags=decode_umount_flags(syscall['flags']),
                     retval=decode_errno(event.union.retval))
             print('{:16} {:<7} {:<7} {:<11} {}'.format(
-                syscall['comm'].decode(), syscall['tgid'], syscall['pid'],
-                syscall['mnt_ns'], call))
+                syscall['comm'].decode('utf-8', 'replace'), syscall['tgid'],
+                syscall['pid'], syscall['mnt_ns'], call))
     except KeyError:
         # This might happen if we lost an event.
         pass
@@ -414,7 +412,11 @@ def main():
     print('{:16} {:<7} {:<7} {:<11} {}'.format(
         'COMM', 'PID', 'TID', 'MNT_NS', 'CALL'))
     while True:
-        b.perf_buffer_poll()
+        try:
+            b.perf_buffer_poll()
+        except KeyboardInterrupt:
+            exit()
+
 
 
 if __name__ == '__main__':

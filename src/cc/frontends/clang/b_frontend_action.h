@@ -75,6 +75,8 @@ class BTypeVisitor : public clang::RecursiveASTVisitor<BTypeVisitor> {
   void genParamIndirectAssign(clang::FunctionDecl *D, std::string& preamble,
                               const char **calling_conv_regs);
   void rewriteFuncParam(clang::FunctionDecl *D);
+  int64_t getFieldValue(clang::VarDecl *Decl, clang::FieldDecl *FDecl,
+                        int64_t OrigFValue);
   template <unsigned N>
   clang::DiagnosticBuilder error(clang::SourceLocation loc, const char (&fmt)[N]);
   template <unsigned N>
@@ -152,7 +154,10 @@ class BFrontendAction : public clang::ASTFrontendAction {
   // should be written.
   BFrontendAction(llvm::raw_ostream &os, unsigned flags, TableStorage &ts,
                   const std::string &id, const std::string &main_path,
-                  FuncSource &func_src, std::string &mod_src);
+                  FuncSource &func_src, std::string &mod_src,
+                  const std::string &maps_ns,
+                  fake_fd_map_def &fake_fd_map,
+                  std::map<std::string, std::vector<std::string>> &perf_events);
 
   // Called by clang when the AST has been completed, here the output stream
   // will be flushed.
@@ -164,14 +169,22 @@ class BFrontendAction : public clang::ASTFrontendAction {
   clang::Rewriter &rewriter() const { return *rewriter_; }
   TableStorage &table_storage() const { return ts_; }
   std::string id() const { return id_; }
+  std::string maps_ns() const { return maps_ns_; }
   bool is_rewritable_ext_func(clang::FunctionDecl *D);
   void DoMiscWorkAround();
+  // negative fake_fd to be different from real fd in bpf_pseudo_fd.
+  int get_next_fake_fd() { return next_fake_fd_--; }
+  void add_map_def(int fd,
+    std::tuple<int, std::string, int, int, int, int, unsigned int, std::string> map_def) {
+    fake_fd_map_[fd] = move(map_def);
+  }
 
  private:
   llvm::raw_ostream &os_;
   unsigned flags_;
   TableStorage &ts_;
   std::string id_;
+  std::string maps_ns_;
   std::unique_ptr<clang::Rewriter> rewriter_;
   friend class BTypeVisitor;
   std::map<std::string, clang::SourceRange> func_range_;
@@ -179,6 +192,9 @@ class BFrontendAction : public clang::ASTFrontendAction {
   FuncSource &func_src_;
   std::string &mod_src_;
   std::set<clang::Decl *> m_;
+  int next_fake_fd_;
+  fake_fd_map_def &fake_fd_map_;
+  std::map<std::string, std::vector<std::string>> &perf_events_;
 };
 
 }  // namespace visitor

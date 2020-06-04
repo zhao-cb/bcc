@@ -70,9 +70,15 @@ int bcc_usdt_get_argument(void *usdt, const char *provider_name,
                           struct bcc_usdt_argument *argument);
 
 int bcc_usdt_enable_probe(void *, const char *, const char *);
+#define BCC_USDT_HAS_FULLY_SPECIFIED_PROBE
+int bcc_usdt_enable_fully_specified_probe(void *, const char *, const char *,
+                                          const char *);
 const char *bcc_usdt_genargs(void **ctx_array, int len);
 const char *bcc_usdt_get_probe_argctype(
   void *ctx, const char* probe_name, const int arg_index
+);
+const char *bcc_usdt_get_fully_specified_probe_argctype(
+  void *ctx, const char* provider_name, const char* probe_name, const int arg_index
 );
 
 typedef void (*bcc_usdt_uprobe_cb)(const char *, const char *, uint64_t, int);

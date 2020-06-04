@@ -14,7 +14,6 @@
 #
 
 from __future__ import print_function
-import ctypes as ct
 from bcc import BPF
 import argparse
 
@@ -73,7 +72,7 @@ int probe_SSL_write(struct pt_regs *ctx, void *ssl, void *buf, int num) {
         bpf_get_current_comm(&__data.comm, sizeof(__data.comm));
 
         if ( buf != 0) {
-                bpf_probe_read(&__data.v0, sizeof(__data.v0), buf);
+                bpf_probe_read_user(&__data.v0, sizeof(__data.v0), buf);
         }
 
         perf_SSL_write.perf_submit(ctx, &__data, sizeof(__data));
@@ -109,7 +108,7 @@ int probe_SSL_read_exit(struct pt_regs *ctx, void *ssl, void *buf, int num) {
         bpf_get_current_comm(&__data.comm, sizeof(__data.comm));
 
         if (bufp != 0) {
-                bpf_probe_read(&__data.v0, sizeof(__data.v0), (char *)*bufp);
+                bpf_probe_read_user(&__data.v0, sizeof(__data.v0), (char *)*bufp);
         }
 
         bufs.delete(&pid);
@@ -171,17 +170,6 @@ TASK_COMM_LEN = 16  # linux/sched.h
 MAX_BUF_SIZE = 464  # Limited by the BPF stack
 
 
-# Max size of the whole struct: 512 bytes
-class Data(ct.Structure):
-    _fields_ = [
-            ("timestamp_ns", ct.c_ulonglong),
-            ("pid", ct.c_uint),
-            ("comm", ct.c_char * TASK_COMM_LEN),
-            ("v0", ct.c_char * MAX_BUF_SIZE),
-            ("len", ct.c_uint)
-    ]
-
-
 # header
 print("%-12s %-18s %-16s %-6s %-6s" % ("FUNC", "TIME(s)", "COMM", "PID",
                                        "LEN"))
@@ -191,16 +179,16 @@ start = 0
 
 
 def print_event_write(cpu, data, size):
-    print_event(cpu, data, size, "WRITE/SEND")
+    print_event(cpu, data, size, "WRITE/SEND", "perf_SSL_write")
 
 
 def print_event_read(cpu, data, size):
-    print_event(cpu, data, size, "READ/RECV")
+    print_event(cpu, data, size, "READ/RECV", "perf_SSL_read")
 
 
-def print_event(cpu, data, size, rw):
+def print_event(cpu, data, size, rw, evt):
     global start
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b[evt].event(data)
 
     # Filter events by command
     if args.comm:
@@ -221,10 +209,14 @@ def print_event(cpu, data, size, rw):
                 " bytes lost) " + "-" * 5
 
     fmt = "%-12s %-18.9f %-16s %-6d %-6d\n%s\n%s\n%s\n\n"
-    print(fmt % (rw, time_s, event.comm.decode(), event.pid, event.len, s_mark,
-                 event.v0.decode(), e_mark))
+    print(fmt % (rw, time_s, event.comm.decode('utf-8', 'replace'),
+                 event.pid, event.len, s_mark,
+                 event.v0.decode('utf-8', 'replace'), e_mark))
 
 b["perf_SSL_write"].open_perf_buffer(print_event_write)
 b["perf_SSL_read"].open_perf_buffer(print_event_read)
 while 1:
-    b.perf_buffer_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

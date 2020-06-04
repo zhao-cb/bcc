@@ -27,8 +27,10 @@
 
 namespace llvm {
 class AllocaInst;
+template<typename T> class ArrayRef;
 class BasicBlock;
 class BranchInst;
+class CallInst;
 class Constant;
 class Instruction;
 class IRBuilderBase;
@@ -65,7 +67,8 @@ class CodegenLLVM : public Visitor {
   EXPAND_NODES(VISIT)
 #undef VISIT
 
-  STATUS_RETURN visit(Node *n, TableStorage &ts, const std::string &id);
+  STATUS_RETURN visit(Node *n, TableStorage &ts, const std::string &id,
+                      const std::string &maps_ns);
 
   int get_table_fd(const std::string &name) const;
 
@@ -103,6 +106,8 @@ class CodegenLLVM : public Visitor {
   StatusTuple lookup_struct_type(StructDeclStmtNode *decl, llvm::StructType **stype) const;
   StatusTuple lookup_struct_type(VariableDeclStmtNode *n, llvm::StructType **stype,
                                  StructDeclStmtNode **decl = nullptr) const;
+  llvm::CallInst *createCall(llvm::Value *Callee,
+                             llvm::ArrayRef<llvm::Value *> Args);
 
   template <typename... Args> void emit(const char *fmt, Args&&... params);
   void emit(const char *s);

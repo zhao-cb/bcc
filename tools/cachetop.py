@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
 # cachetop      Count cache kernel function calls per processes
@@ -40,7 +40,7 @@ FIELDS = (
     "WRITE_HIT%"
 )
 DEFAULT_FIELD = "HITS"
-
+DEFAULT_SORT_FIELD = FIELDS.index(DEFAULT_FIELD)
 
 # signal handler
 def signal_ignore(signal, frame):
@@ -61,7 +61,7 @@ def get_meminfo():
 
 def get_processes_stats(
         bpf,
-        sort_field=FIELDS.index(DEFAULT_FIELD),
+        sort_field=DEFAULT_SORT_FIELD,
         sort_reverse=False):
     '''
     Return a tuple containing:
@@ -72,7 +72,7 @@ def get_processes_stats(
     counts = bpf.get_table("counts")
     stats = defaultdict(lambda: defaultdict(int))
     for k, v in counts.items():
-        stats["%d-%d-%s" % (k.pid, k.uid, k.comm.decode())][k.ip] = v.value
+        stats["%d-%d-%s" % (k.pid, k.uid, k.comm.decode('utf-8', 'replace'))][k.ip] = v.value
     stats_list = []
 
     for pid, count in sorted(stats.items(), key=lambda stat: stat[0]):
@@ -107,7 +107,7 @@ def get_processes_stats(
             misses = (apcl + apd)
 
             # rtaccess is the read hit % during the sample period.
-            # wtaccess is the write hit % during the smaple period.
+            # wtaccess is the write hit % during the sample period.
             if mpa > 0:
                 rtaccess = float(mpa) / (access + misses)
             if apcl > 0:
@@ -136,7 +136,7 @@ def handle_loop(stdscr, args):
     stdscr.nodelay(1)
     # set default sorting field
     sort_field = FIELDS.index(DEFAULT_FIELD)
-    sort_reverse = False
+    sort_reverse = True
 
     # load BPF program
     bpf_text = """
@@ -223,7 +223,7 @@ def handle_loop(stdscr, args):
             uid = int(stat[1])
             try:
                 username = pwd.getpwuid(uid)[0]
-            except KeyError as ex:
+            except KeyError:
                 # `pwd` throws a KeyError if the user cannot be found. This can
                 # happen e.g. when the process is running in a cgroup that has
                 # different users from the host.
